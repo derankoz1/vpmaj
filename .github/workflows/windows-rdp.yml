@@ -11,6 +11,17 @@ on:
         description: 'How many servers at the same time? (1-20)'
         required: true
         default: '5'
+      cancel_previous:
+        description: 'Cancel the previous run first (frees its runner slots)'
+        type: boolean
+        required: false
+        default: false
+
+# Without this, a new dispatch runs side-by-side with the old 6h run and
+# competes for the same runner slots -> half your jobs sit in "busy" limbo.
+concurrency:
+  group: rdp-windows-servers
+  cancel-in-progress: ${{ inputs.cancel_previous }}
 
 jobs:
   # ------------------------------------------------------------------
@@ -62,6 +73,26 @@ jobs:
       RUN_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
+      - name: 0. Report slot wait time
+        shell: powershell
+        continue-on-error: true
+        run: |
+          # If this is more than a couple of minutes, this job sat in the queue
+          # because all windows-latest runners were busy (account concurrency
+          # limit), not because of a bug in this workflow.
+          try {
+              $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+              $run = Invoke-RestMethod -Uri $url -Headers @{ 'User-Agent' = 'actions-runner' } -TimeoutSec 30
+              $created = [datetime]::Parse($run.created_at, $null, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+              $waited  = ([datetime]::UtcNow - $created).TotalMinutes
+              Write-Host ("Server ID {0}: queued {1:N1} min before a runner picked it up" -f $env:SERVER_ID, $waited)
+              if ($waited -gt 2) {
+                  Write-Warning ("This job waited {0:N0} min - your account was out of concurrent runner slots." -f $waited)
+              }
+          } catch {
+              Write-Host "Could not read run start time: $($_.Exception.Message)"
+          }
+
       - name: 1. Checkout Repo
         uses: actions/checkout@v4
 
@@ -265,7 +296,7 @@ jobs:
             BODY=$(curl -sS -m 30 -X POST \
               "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
               -H "Content-Type: application/json" \
-              -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$IP\"}")
+              -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"server-${SERVER_ID}  $IP  (${SERVER_ID}/${MAX_SERVERS})\"}")
 
             if echo "$BODY" | grep -q '"ok":true'; then
               echo "Successfully sent IP to Telegram on attempt $attempt."
@@ -281,6 +312,10 @@ jobs:
           if [ "$SENT" -ne 1 ]; then
             echo "::warning::Telegram never accepted the message for this runner ($IP)"
           fi
+
+          # Audit trail: if a server_id is missing here, that job is still queued
+          # because your account ran out of concurrent runner slots.
+          echo "| server-$SERVER_ID | $IP | $(date -u +%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 7. Deploy App, Patch settings.ini & Setup Autostart
         shell: powershell
