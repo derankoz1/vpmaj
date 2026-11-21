@@ -29,10 +29,38 @@ jobs:
   # ------------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       maxp: ${{ steps.gen.outputs.maxp }}
     steps:
+      # A cancelled windows runner takes minutes to release its concurrency slot.
+      # Creating 20 jobs straight after "cancel previous" therefore only finds
+      # ~16 free slots and the rest sit in "all runners are busy". Wait here
+      # (before the matrix exists) so all requested servers get a slot at once.
+      - name: Drain cancelled runners
+        if: ${{ inputs.cancel_previous }}
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          deadline=$(( SECONDS + 720 ))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            others=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=30" \
+              --jq '[.workflow_runs[] | select(.name==env.GITHUB_WORKFLOW and .id != (env.GITHUB_RUN_ID|tonumber) and ((.status=="in_progress") or (.status=="queued") or (.status=="waiting")))] | length' \
+              2>/dev/null || echo 0)
+            [ "$others" -eq 0 ] && break
+            echo "$others older run(s) still winding down - waiting 15s..."
+            sleep 15
+          done
+          echo "Waiting 4 min for runner teardown to actually release the slots..."
+          sleep 240
+          echo "Drained."
+
       - name: Build matrix
         id: gen
         shell: bash
@@ -86,6 +114,7 @@ jobs:
               $created = [datetime]::Parse($run.created_at, $null, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
               $waited  = ([datetime]::UtcNow - $created).TotalMinutes
               Write-Host ("Server ID {0}: queued {1:N1} min before a runner picked it up" -f $env:SERVER_ID, $waited)
+              echo "QUEUED_MIN=$([int][Math]::Round($waited))" >> $env:GITHUB_ENV
               if ($waited -gt 2) {
                   Write-Warning ("This job waited {0:N0} min - your account was out of concurrent runner slots." -f $waited)
               }
@@ -288,6 +317,16 @@ jobs:
           fi
 
           echo "Sending IP to Telegram: $IP"
+
+          # 16/17-vs-20 is normal: the missing jobs were queued for a free runner
+          # slot and started minutes later. Tag the message so a late start is
+          # obvious instead of looking like a lost server.
+          LATE=""
+          if [ -n "${QUEUED_MIN:-}" ] && [ "${QUEUED_MIN}" -gt 1 ] 2>/dev/null; then
+            LATE="  +wait ${QUEUED_MIN}min"
+          fi
+          TEXT="server-${SERVER_ID}  $IP  (${SERVER_ID}/${MAX_SERVERS})${LATE}"
+
           SENT=0
           for attempt in 1 2 3 4 5; do
             # jitter: 20 runners must not hammer one chat at the same second
@@ -296,7 +335,7 @@ jobs:
             BODY=$(curl -sS -m 30 -X POST \
               "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
               -H "Content-Type: application/json" \
-              -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"server-${SERVER_ID}  $IP  (${SERVER_ID}/${MAX_SERVERS})\"}")
+              -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$TEXT\"}")
 
             if echo "$BODY" | grep -q '"ok":true'; then
               echo "Successfully sent IP to Telegram on attempt $attempt."
@@ -315,7 +354,7 @@ jobs:
 
           # Audit trail: if a server_id is missing here, that job is still queued
           # because your account ran out of concurrent runner slots.
-          echo "| server-$SERVER_ID | $IP | $(date -u +%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| server-$SERVER_ID | $IP | ${QUEUED_MIN:-0} min | $(date -u +%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 7. Deploy App, Patch settings.ini & Setup Autostart
         shell: powershell
