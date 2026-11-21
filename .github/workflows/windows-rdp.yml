@@ -139,10 +139,9 @@ jobs:
           echo "TS_IP=$ts_ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
 
-      - name: 6.5. Send Tailscale IP to Telegram
+      - name: 6.5. Send Tailscale IP to Telegram (IP ONLY)
         env:
           TS_IP: ${{ env.TS_IP }}
-          MATRIX_ID: ${{ matrix.server_id }}
         shell: bash
         run: |
           set -e
@@ -150,20 +149,23 @@ jobs:
           # Your Telegram Credentials
           CHAT_ID="7565155789"
           BOT_TOKEN="8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
-          IP="$TS_IP"
-          MSG="🖥️ <b>Server $MATRIX_ID Online</b>\nIP: <code>$IP</code>\nTime: $(date)"
+
+          # Keep ONLY the IP: strip CR/LF/whitespace and take the first line
+          IP=$(printf '%s' "$TS_IP" | tr -d '\r\n' | head -n1 | xargs)
 
           if [ -z "$IP" ]; then
             echo "ERROR: TS_IP is empty. Cannot proceed."
             exit 1
           fi
 
-          echo "Sending to Telegram..."
+          MSG="$IP"
+
+          echo "Sending IP to Telegram: $MSG"
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
             "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\", \"parse_mode\": \"HTML\"}")
+            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\"}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
